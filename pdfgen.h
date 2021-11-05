@@ -69,6 +69,74 @@ struct pdf_info {
 };
 
 /**
+ * Enum that declares the different image file formats which are supported.
+ * Each value has a corresponding header struct used within
+ * the format_specific_img_info union.
+ */
+enum {
+    IMAGE_PNG,
+    IMAGE_JPG,
+    IMAGE_PPM,
+    IMAGE_BMP,
+
+    IMAGE_UNKNOWN
+};
+
+/**
+ * Since we're casting random areas of memory to these, make sure
+ * they're packed properly to match the image format requirements
+ */
+#pragma pack(push, 1)
+struct png_header {
+    uint32_t width;
+    uint32_t height;
+    uint8_t bitdepth;
+    uint8_t colortype;
+    uint8_t deflate;
+    uint8_t filtering;
+    uint8_t interlace;
+};
+
+struct bmp_header {
+    uint32_t bfSize;
+    uint16_t bfReserved1; // ignore!
+    uint16_t bfReserved2; // ignore!
+    uint32_t bfOffBits;
+    uint32_t biSize;
+    int32_t biWidth;
+    int32_t biHeight;
+    uint16_t biPlanes; // ignore!
+    uint16_t biBitCount;
+    uint32_t biCompression;
+};
+#pragma pack(pop)
+struct jpeg_header {
+    int ncolours;
+};
+
+struct ppm_header {
+    uint64_t size;         // Indicate the number of bytes of RGB data
+    size_t data_begin_pos; // position in the data where the rgb data starts
+};
+
+union format_specific_img_info {
+    struct png_header png;
+    struct bmp_header bmp;
+    struct jpeg_header jpeg;
+    struct ppm_header ppm;
+};
+
+struct img_info {
+    int image_format; // Indicates the image format (IMAGE_PNG, IMAGE_JPG,
+                      // ...)
+    uint32_t width;
+    uint32_t height;
+
+    union format_specific_img_info
+        specific_info; // Information specific to the used file format
+};
+
+/**
  * pdf_path_operation holds information about a path
  * drawing operation.
  * See PDF reference for detailed usage.
@@ -555,7 +623,6 @@ int pdf_add_rgb24(struct pdf_doc *pdf, struct pdf_object *page, float x,
                   float y, float display_width, float display_height,
                   const uint8_t *data, uint32_t width, uint32_t height);
 
-
 /**
  * Add an image file as an image to the document.
  * Support image formats: JPEG, PNG, BMP & PPM
@@ -571,6 +638,12 @@ int pdf_add_rgb24(struct pdf_doc *pdf, struct pdf_object *page, float x,
 int pdf_add_image_file(struct pdf_doc *pdf, struct pdf_object *page, float x,
                        float y, float display_width, float display_height,
                        const char *image_filename);
+
+int parse_image_header(struct img_info *info, const uint8_t *data,
+                       size_t length, char *err_msg, size_t err_msg_length);
+
+int parse_image_header_(struct img_info *info, const char *image_filename,
+                        char *err_msg, size_t err_msg_length);
 
 #ifdef __cplusplus
 }

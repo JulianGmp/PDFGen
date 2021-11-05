@@ -192,6 +192,11 @@ static const uint8_t png_signature[] = {0x89, 0x50, 0x4E, 0x47,
 static const uint8_t jpeg_signature[] = {0xff, 0xd8};
 static const uint8_t ppm_signature[] = {'P', '6'};
 
+// Special signatures for PNG chunks
+static const char png_chunk_header[] = "IHDR";
+static const char png_chunk_data[] = "IDAT";
+static const char png_chunk_end[] = "IEND";
+
 typedef struct pdf_object pdf_object;
 
 enum {
@@ -284,39 +289,7 @@ struct png_chunk {
     uint32_t length;
     char type[4];
 };
-
-struct png_header {
-    uint32_t width;
-    uint32_t height;
-    uint8_t bitdepth;
-    uint8_t colortype;
-    uint8_t deflate;
-    uint8_t filtering;
-    uint8_t interlace;
-};
-
-struct bmp_header {
-    uint32_t bfSize;
-    uint16_t bfReserved1; // ignore!
-    uint16_t bfReserved2; // ignore!
-    uint32_t bfOffBits;
-    uint32_t biSize;
-    int32_t biWidth;
-    int32_t biHeight;
-    uint16_t biPlanes; // ignore!
-    uint16_t biBitCount;
-    uint32_t biCompression;
-};
 #pragma pack(pop)
-
-struct png_info {
-    uint32_t length;
-    uint8_t bitdepth;
-    uint8_t ncolours;
-    uint32_t width;
-    uint32_t height;
-    uint8_t *data;
-};
 
 /**
  * Simple flexible resizing array implementation
@@ -2252,8 +2225,9 @@ int pdf_add_barcode(struct pdf_doc *pdf, struct pdf_object *page, int code,
     }
 }
 
-static pdf_object *pdf_add_raw_rgb24(struct pdf_doc *pdf, const uint8_t *data,
-                                     uint32_t width, uint32_t height)
+static struct pdf_object *pdf_add_raw_rgb24(struct pdf_doc *pdf,
+                                            const uint8_t *data,
+                                            uint32_t width, uint32_t height)
 {
     struct pdf_object *obj;
     size_t len;
@@ -2286,30 +2260,6 @@ static pdf_object *pdf_add_raw_rgb24(struct pdf_doc *pdf, const uint8_t *data,
     obj->stream = str;
 
     return obj;
-}
-
-/* See http://www.videotechnology.com/jpeg/j1.html for details */
-static int jpeg_details(const uint8_t *data, size_t data_size, int *width,
-                        int *height, int *ncolours)
-{
-    if (data_size < 4 || data[0] != 0xFF || data[1] != 0xD8)
-        return -1;
-    for (size_t i = 0; i < data_size - 3; i++) {
-        /* Search for SOFn marker and decode jpeg details */
-        if (data[i] == 0xff && (data[i + 1] & 0xf0) == 0xc0) {
-            int len = data[i + 2] * 256 + data[i + 3];
-            if (len >= 9 && i + len < data_size) {
-                if (height)
-                    *height = data[i + 5] * 256 + data[i + 6];
-                if (width)
-                    *width = data[i + 7] * 256 + data[i + 8];
-                if (ncolours)
-                    *ncolours = data[i + 9];
-                return 0;
-            }
-        }
-    }
-    return -1;
 }
 
 static uint8_t *get_file(struct pdf_doc *pdf, const char *file_name,
@@ -2356,18 +2306,11 @@ static uint8_t *get_file(struct pdf_doc *pdf, const char *file_name,
     return file_data;
 }
 
-static pdf_object *pdf_add_raw_jpeg_data(struct pdf_doc *pdf,
-                                         const uint8_t *jpeg_data, size_t len)
+static struct pdf_object *
+pdf_add_raw_jpeg_data(struct pdf_doc *pdf, const struct img_info *info,
+                      const uint8_t *jpeg_data, size_t len)
 {
-    struct pdf_object *obj;
-    int width, height, ncolours;
-
-    if (jpeg_details(jpeg_data, len, &width, &height, &ncolours) < 0) {
-        pdf_set_err(pdf, -EINVAL, "Unable to determine jpeg width/height");
-        return NULL;
-    }
-
-    obj = pdf_add_object(pdf, OBJ_image);
+    struct pdf_object *obj = pdf_add_object(pdf, OBJ_image);
     if (!obj)
         return NULL;
     dstr_printf(&obj->stream,
@@ -2375,15 +2318,56 @@ static pdf_object *pdf_add_raw_jpeg_data(struct pdf_doc *pdf,
                 "/Subtype /Image\r\n/ColorSpace %s\r\n"
                 "/Width %d\r\n/Height %d\r\n"
                 "/BitsPerComponent 8\r\n/Filter /DCTDecode\r\n"
-                "/Length %d\r\n>>stream\r\n",
+                "/Length %zu\r\n>>stream\r\n",
                 flexarray_size(&pdf->objects),
-                ncolours == 1 ? "/DeviceGray" : "/DeviceRGB", width, height,
-                (int)len);
+                (info->specific_info.jpeg.ncolours == 1) ? "/DeviceGray"
+                                                         : "/DeviceRGB",
+                info->width, info->height, len);
     dstr_append_data(&obj->stream, jpeg_data, len);
 
     dstr_printf(&obj->stream, "\r\nendstream\r\n");
 
     return obj;
+}
+
+/**
+ * Get the display dimensions of an image, respecting the images aspect ratio
+ * if only one desired display dimension is defined.
+ * The pdf parameter is only used for setting the error value.
+ */
+static int get_img_display_dimensions(struct pdf_doc *pdf, uint32_t img_width,
+                                      uint32_t img_height,
+                                      float *display_width,
+                                      float *display_height)
+{
+    if (!display_height || !display_height) {
+        return pdf_set_err(
+            pdf, -EINVAL,
+            "display_width and display_height may not be null pointers");
+    }
+
+    const float display_width_in = *display_width;
+    const float display_height_in = *display_height;
+
+    if (display_width_in < 0 && display_height_in < 0) {
+        return pdf_set_err(pdf, -EINVAL,
+                           "Unable to determine image display dimensions, "
+                           "display_width and display_height are both < 0");
+    }
+    if (img_width == 0 || img_height == 0) {
+        return pdf_set_err(pdf, -EINVAL,
+                           "Invalid image dimensions received, the loaded "
+                           "image appears to be empty.");
+    }
+
+    if (display_width_in < 0) {
+        // Set width, keeping aspect ratio
+        *display_width = display_height_in * ((float)img_width / img_height);
+    } else if (display_height_in < 0) {
+        // Set height, keeping aspect ratio
+        *display_height = display_width_in * ((float)img_height / img_width);
+    }
+    return 0;
 }
 
 static int pdf_add_image(struct pdf_doc *pdf, struct pdf_object *page,
@@ -2435,66 +2419,111 @@ static size_t dgets(const uint8_t *data, size_t *pos, size_t len, char *line,
     return *pos;
 }
 
-static int pdf_add_ppm_data(struct pdf_doc *pdf, struct pdf_object *page,
-                            float x, float y, float display_width,
-                            float display_height, const uint8_t *ppm_data,
-                            size_t len)
+static int parse_ppm_header(struct img_info *info, const uint8_t *data,
+                            size_t length, char *err_msg,
+                            size_t err_msg_length)
 {
     char line[1024];
-    uint32_t width, height, size;
+    memset(line, '\0', sizeof(line));
     size_t pos = 0;
 
-    /* Load the PPM file */
-    if (!dgets(ppm_data, &pos, len, line, sizeof(line) - 1)) {
-        return pdf_set_err(pdf, -EINVAL, "Invalid PPM file");
+    // Load the PPM file
+    if (!dgets(data, &pos, length, line, sizeof(line) - 1)) {
+        snprintf(err_msg, err_msg_length, "Invalid PPM file");
+        return -EINVAL;
+    }
+    // We only support binary ppms
+    if (strncmp(line, "P6", 2) != 0) {
+        snprintf(err_msg, err_msg_length, "Only binary PPM files supported");
+        return -EINVAL;
     }
 
-    /* We only support binary ppms */
-    if (strncmp(line, "P6", 2) != 0)
-        return pdf_set_err(pdf, -EINVAL, "Only binary PPM files supported");
+    // Skip comments before header
+    while (line[0] == '#') {
+        if (!dgets(data, &pos, length, line, sizeof(line) - 1)) {
+            snprintf(err_msg, err_msg_length, "Unable to find PPM size");
+            return -EINVAL;
+        }
+    }
 
-    /* Skip the header comments until we get to the dimensions info */
-    do {
-        if (!dgets(ppm_data, &pos, len, line, sizeof(line) - 1))
-            return pdf_set_err(pdf, -EINVAL, "Unable to find PPM size");
-        if (line[0] != '#')
-            break;
-    } while (1);
+    // Read image dimensions
+    if (sscanf(line, "%u %u\n", &(info->width), &(info->height)) != 2) {
+        snprintf(err_msg, err_msg_length, "Unable to find PPM size");
+        return -EINVAL;
+    }
+    info->specific_info.ppm.size = info->width * info->height * 3;
+    info->specific_info.ppm.data_begin_pos = pos;
 
-    if (sscanf(line, "%u %u\n", &width, &height) != 2)
-        return pdf_set_err(pdf, -EINVAL, "Unable to find PPM size");
+    return 0;
+}
+
+static int pdf_add_ppm_data(struct pdf_doc *pdf, struct pdf_object *page,
+                            float x, float y, float display_width,
+                            float display_height, struct img_info *info,
+                            const uint8_t *ppm_data, size_t len)
+{
+    char line[1024];
+    // We start reading at the position delivered by parse_ppm_header,
+    // since we already parsed the header of the file there.
+    size_t pos = info->specific_info.ppm.data_begin_pos;
 
     /* Skip over the byte-size line */
     if (!dgets(ppm_data, &pos, len, line, sizeof(line) - 1))
         return pdf_set_err(pdf, -EINVAL, "No byte-size line in PPM file");
 
     /* Try and limit the memory usage to sane images */
-    if (width > 4096 || height > 4096) {
+    if (info->width > 4096 || info->height > 4096) {
         return pdf_set_err(pdf, -EINVAL,
-                           "Invalid width/height in PPM file: %ux%u", width,
-                           height);
+                           "Invalid width/height in PPM file: %ux%u",
+                           info->width, info->height);
     }
 
-    size = width * height * 3;
-    if (size > len - pos) {
+    if (info->specific_info.ppm.size > len - pos) {
         return pdf_set_err(pdf, -EINVAL, "Insufficient RGB data available");
     }
 
     return pdf_add_rgb24(pdf, page, x, y, display_width, display_height,
-                         &ppm_data[pos], width, height);
+                         &ppm_data[pos], info->width, info->height);
+}
+
+static int parse_jpeg_header(struct img_info *info, const uint8_t *data,
+                             size_t length, char *err_msg,
+                             size_t err_msg_length)
+{
+    /* See http://www.videotechnology.com/jpeg/j1.html for details */
+    if (length >= 4 && data[0] == 0xFF && data[1] == 0xD8) {
+        for (size_t i = 0; i < length - 3; i++) {
+            /* Search for SOFn marker and decode jpeg details */
+            if (data[i] == 0xff && (data[i + 1] & 0xf0) == 0xc0) {
+                int len = data[i + 2] * 256 + data[i + 3];
+                if (len >= 9 && i + len < length) {
+                    info->height = data[i + 5] * 256 + data[i + 6];
+                    info->width = data[i + 7] * 256 + data[i + 8];
+                    info->specific_info.jpeg.ncolours = data[i + 9];
+                    return 0;
+                }
+            }
+        }
+    }
+    snprintf(err_msg, err_msg_length, "Error parsing JPEG header");
+    return -EINVAL;
 }
 
 static int pdf_add_jpeg_data(struct pdf_doc *pdf, struct pdf_object *page,
                              float x, float y, float display_width,
-                             float display_height, const uint8_t *jpeg_data,
-                             size_t len)
+                             float display_height, struct img_info *info,
+                             const uint8_t *jpeg_data, size_t len)
 {
     struct pdf_object *obj;
 
-    obj = pdf_add_raw_jpeg_data(pdf, jpeg_data, len);
+    obj = pdf_add_raw_jpeg_data(pdf, info, jpeg_data, len);
     if (!obj)
         return pdf->errval;
 
+    if (get_img_display_dimensions(pdf, info->width, info->height,
+                                   &display_width, &display_height)) {
+        return pdf->errval;
+    }
     return pdf_add_image(pdf, page, obj, x, y, display_width, display_height);
 }
 
@@ -2511,32 +2540,83 @@ int pdf_add_rgb24(struct pdf_doc *pdf, struct pdf_object *page, float x,
     return pdf_add_image(pdf, page, obj, x, y, display_width, display_height);
 }
 
+static int parse_png_header(struct img_info *info, const uint8_t *data,
+                            size_t length, char *err_msg,
+                            size_t err_msg_length)
+{
+    if (length <= sizeof(png_signature)) {
+        snprintf(err_msg, err_msg_length, "PNG file too short");
+        return -EINVAL;
+    }
+
+    if (memcmp(data, png_signature, sizeof(png_signature))) {
+        snprintf(err_msg, err_msg_length, "File is not correct PNG file");
+        return -EINVAL;
+    }
+    // process first PNG chunk
+    uint32_t pos = sizeof(png_signature);
+    const struct png_chunk *chunk = (const struct png_chunk *)&data[pos];
+    pos += sizeof(struct png_chunk);
+    if (pos > length) {
+        snprintf(err_msg, err_msg_length, "PNG file too short");
+        return -EINVAL;
+    }
+    if (strncmp(chunk->type, png_chunk_header, 4) == 0) {
+        // header found, process width and height, check errors
+        struct png_header *header = &(info->specific_info.png);
+        memcpy(header, &data[pos], sizeof(struct png_header));
+
+        if (pos + sizeof(struct png_header) > length) {
+            snprintf(err_msg, err_msg_length, "PNG file too short");
+            return -EINVAL;
+        }
+        if (header->deflate != 0) {
+            snprintf(err_msg, err_msg_length, "Deflate wrong in PNG header");
+            return -EINVAL;
+        }
+        if (header->bitdepth == 0) {
+            snprintf(err_msg, err_msg_length, "PNG file has zero bit depth");
+            return -EINVAL;
+        }
+        // ensure the width and height values have the proper byte order
+        // and copy them into the info struct.
+        header->width = ntoh32(header->width);
+        header->height = ntoh32(header->height);
+        info->width = header->width;
+        info->height = header->height;
+        return 0;
+    }
+    snprintf(err_msg, err_msg_length, "Failed to read PNG file header");
+    return -EINVAL;
+}
+
 static int pdf_add_png_data(struct pdf_doc *pdf, struct pdf_object *page,
                             float x, float y, float display_width,
-                            float display_height, const uint8_t *png_data,
-                            size_t len)
+                            float display_height,
+                            const struct img_info *img_info,
+                            const uint8_t *png_data, size_t len)
 {
-    const char png_chunk_header[] = "IHDR";
-    const char png_chunk_data[] = "IDAT";
-    const char png_chunk_end[] = "IEND";
     struct pdf_object *obj;
     uint8_t *final_data;
     int written = 0;
     uint32_t pos;
-    struct png_info info = {
-        .length = 0,
-        .bitdepth = 0,
-        .ncolours = 0,
-        .width = 0,
-        .height = 0,
-        .data = NULL,
-    };
+    uint8_t *png_data_temp = NULL;
+    size_t png_data_total_length = 0;
+    uint8_t ncolours;
 
-    if (len <= sizeof(png_signature))
-        return pdf_set_err(pdf, -EINVAL, "PNG file too short");
+    const struct png_header *header = &(img_info->specific_info.png);
 
-    if (memcmp(png_data, png_signature, sizeof(png_signature)))
-        return pdf_set_err(pdf, -EINVAL, "File is not correct PNG file");
+    // Gather information from the png header
+    if (header->colortype == PNG_COLOR_RGB) {
+        ncolours = 3;
+    } else if (header->colortype == PNG_COLOR_INDEXED) {
+        ncolours = 1;
+    } else {
+        pdf_set_err(pdf, -EINVAL, "PNG has unsupported color type: %d",
+                    header->colortype);
+        goto info_free;
+    }
+
     /* process PNG chunks */
     pos = sizeof(png_signature);
     while (1) {
@@ -2549,47 +2629,20 @@ static int pdf_add_png_data(struct pdf_doc *pdf, struct pdf_object *page,
             goto info_free;
         }
         if (strncmp(chunk->type, png_chunk_header, 4) == 0) {
-            /* header found, process width and height, check errors */
-            const struct png_header *header =
-                (const struct png_header *)&png_data[pos];
-            if (pos + sizeof(struct png_header) > len) {
-                pdf_set_err(pdf, -EINVAL, "PNG file too short");
-                goto info_free;
-            }
-            if (header->deflate != 0) {
-                pdf_set_err(pdf, -EINVAL, "Deflate wrong in PNG header");
-                goto info_free;
-            }
-            if (header->colortype & PNG_COLOR_ALPHA) {
-                pdf_set_err(pdf, -EINVAL,
-                            "PDF doesn't support PNG alpha channel");
-                goto info_free;
-            }
-            info.width = ntoh32(header->width);
-            info.height = ntoh32(header->height);
-            info.bitdepth = header->bitdepth;
-            if (header->colortype == PNG_COLOR_RGB)
-                info.ncolours = 3;
-            else if (header->colortype == PNG_COLOR_INDEXED)
-                info.ncolours = 1;
-            else {
-                pdf_set_err(pdf, -EINVAL,
-                            "PNG has unsupported color type: %d",
-                            header->colortype);
-                goto info_free;
-            }
+            // skipping the header
         } else if (strncmp(chunk->type, png_chunk_data, 4) == 0) {
             uint32_t chunk_len = ntoh32(chunk->length);
             if (chunk_len > 0 && chunk_len < len - pos) {
-                uint8_t *data =
-                    (uint8_t *)realloc(info.data, info.length + chunk_len);
+                uint8_t *data = (uint8_t *)realloc(
+                    png_data_temp, png_data_total_length + chunk_len);
                 if (!data) {
                     pdf_set_err(pdf, -ENOMEM, "No memory for PNG data");
                     goto info_free;
                 }
-                info.data = data;
-                memcpy(&info.data[info.length], &png_data[pos], chunk_len);
-                info.length += chunk_len;
+                png_data_temp = data;
+                memcpy(&png_data_temp[png_data_total_length], &png_data[pos],
+                       chunk_len);
+                png_data_total_length += chunk_len;
             }
         } else if (strncmp(chunk->type, png_chunk_end, 4) == 0) {
             /* end of file, exit */
@@ -2609,15 +2662,15 @@ static int pdf_add_png_data(struct pdf_doc *pdf, struct pdf_object *page,
         }
     }
     /* if no length was found */
-    if (info.length == 0 || info.bitdepth == 0) {
-        pdf_set_err(pdf, -EINVAL, "PNG file has zero length/bitdepth");
+    if (png_data_total_length == 0) {
+        pdf_set_err(pdf, -EINVAL, "PNG file has zero length");
         goto info_free;
     }
 
-    final_data = (uint8_t *)malloc(info.length + 1024);
+    final_data = (uint8_t *)malloc(png_data_total_length + 1024);
     if (!final_data) {
-        pdf_set_err(pdf, -ENOMEM, "Unable to allocate PNG data %d",
-                    info.length + 1024);
+        pdf_set_err(pdf, -ENOMEM, "Unable to allocate PNG data %zu",
+                    png_data_total_length + 1024);
         goto info_free;
     }
 
@@ -2630,15 +2683,15 @@ static int pdf_add_png_data(struct pdf_doc *pdf, struct pdf_object *page,
                       "/BitsPerComponent %u\r\n/Filter /FlateDecode\r\n"
                       "/DecodeParms << /Predictor 15 /Colors %d "
                       "/BitsPerComponent %u /Columns %u >>\r\n"
-                      "/Length %u\r\n>>stream\r\n",
+                      "/Length %zu\r\n>>stream\r\n",
                       flexarray_size(&pdf->objects),
-                      info.ncolours == 1 ? "/Indexed " : "", info.width,
-                      info.height, info.bitdepth, info.ncolours,
-                      info.bitdepth, info.width, info.length);
+                      ncolours == 1 ? "/Indexed " : "", header->width,
+                      header->height, header->bitdepth, ncolours,
+                      header->bitdepth, header->width, png_data_total_length);
 
-    memcpy(&final_data[written], info.data, info.length);
-    free(info.data);
-    written += info.length;
+    memcpy(&final_data[written], png_data_temp, png_data_total_length);
+    free(png_data_temp);
+    written += png_data_total_length;
     written += sprintf((char *)&final_data[written], "\r\nendstream\r\n");
 
     obj = pdf_add_object(pdf, OBJ_image);
@@ -2650,33 +2703,53 @@ static int pdf_add_png_data(struct pdf_doc *pdf, struct pdf_object *page,
 
     free(final_data);
 
+    if (get_img_display_dimensions(pdf, header->width, header->height,
+                                   &display_width, &display_height)) {
+        return pdf->errval;
+    }
     return pdf_add_image(pdf, page, obj, x, y, display_width, display_height);
 
 info_free:
-    if (info.data)
-        free(info.data);
+    if (png_data_temp)
+        free(png_data_temp);
     return pdf->errval;
+}
+
+static int parse_bmp_header(struct img_info *info, const uint8_t *data,
+                            size_t data_length, char *err_msg,
+                            size_t err_msg_length)
+{
+    if (data_length < sizeof(bmp_signature) + sizeof(struct bmp_header)) {
+        snprintf(err_msg, err_msg_length, "File is too short");
+        return -EINVAL;
+    }
+
+    if (memcmp(data, bmp_signature, sizeof(bmp_signature))) {
+        snprintf(err_msg, err_msg_length, "File is not correct BMP file");
+        return -EINVAL;
+    }
+    memcpy(&(info->specific_info.bmp), data, sizeof(bmp_signature));
+    info->width = info->specific_info.bmp.biWidth;
+    // biHeight might be negative (positive indicates vertically mirrored
+    // lines)
+    info->height = abs(info->specific_info.bmp.biHeight);
+    return 0;
 }
 
 static int pdf_add_bmp_data(struct pdf_doc *pdf, struct pdf_object *page,
                             float x, float y, float display_width,
-                            float display_height, const uint8_t *data,
-                            const size_t len)
+                            float display_height, const struct img_info *info,
+                            const uint8_t *data, const size_t len)
 {
-    const struct bmp_header *header;
+    const struct bmp_header *header = &(info->specific_info.bmp);
     uint8_t *bmp_data = NULL;
     uint8_t row_padding;
-    uint32_t width, height, bpp;
-    bool flip = true;
-    int retval;
+    uint32_t bpp;
     size_t data_len;
+    int retval;
+    const uint32_t width = info->width;
+    const uint32_t height = info->height;
 
-    if (len < sizeof(bmp_signature) + sizeof(struct bmp_header))
-        return pdf_set_err(pdf, -EINVAL, "File is too short");
-
-    if (memcmp(data, bmp_signature, sizeof(bmp_signature)))
-        return pdf_set_err(pdf, -EINVAL, "File is not correct BMP file");
-    header = (const struct bmp_header *)&data[sizeof(bmp_signature)];
     if (header->bfSize != len)
         return pdf_set_err(pdf, -EINVAL,
                            "BMP file seems to have wrong length");
@@ -2696,13 +2769,6 @@ static int pdf_add_bmp_data(struct pdf_doc *pdf, struct pdf_object *page,
         return pdf_set_err(pdf, -EINVAL, "Unsupported BMP bitdepth: %d",
                            header->biBitCount);
     bpp = header->biBitCount / 8;
-    width = header->biWidth;
-    if (header->biHeight < 0) {
-        flip = false;
-        height = -header->biHeight;
-    } else {
-        height = header->biHeight;
-    }
     /* BMP rows are 4-bytes padded! */
     row_padding = (width * bpp) & 3;
     data_len = (size_t)width * (size_t)height * 3;
@@ -2746,7 +2812,7 @@ static int pdf_add_bmp_data(struct pdf_doc *pdf, struct pdf_object *page,
         return pdf_set_err(pdf, -EINVAL, "Unsupported BMP bitdepth: %d",
                            header->biBitCount);
     }
-    if (flip) {
+    if (header->biHeight >= 0) {
         /* BMP has vertically mirrored representation of lines, so swap them
          */
         uint8_t *line = (uint8_t *)malloc(width * 3);
@@ -2772,16 +2838,7 @@ static int pdf_add_bmp_data(struct pdf_doc *pdf, struct pdf_object *page,
     return retval;
 }
 
-enum {
-    IMAGE_PNG,
-    IMAGE_JPG,
-    IMAGE_PPM,
-    IMAGE_BMP,
-
-    IMAGE_UNKNOWN
-};
-
-static int header_to_image(const uint8_t *data, size_t length)
+static int determine_image_format(const uint8_t *data, size_t length)
 {
     if (length >= sizeof(png_signature) &&
         memcmp(data, png_signature, sizeof(png_signature)) == 0)
@@ -2799,25 +2856,79 @@ static int header_to_image(const uint8_t *data, size_t length)
     return IMAGE_UNKNOWN;
 }
 
+int parse_image_header(struct img_info *info, const uint8_t *data,
+                       size_t length, char *err_msg, size_t err_msg_length)
+
+{
+    const int image_format = determine_image_format(data, length);
+    info->image_format = image_format;
+    switch (image_format) {
+    case IMAGE_PNG:
+        return parse_png_header(info, data, length, err_msg, err_msg_length);
+    case IMAGE_BMP:
+        return parse_bmp_header(info, data, length, err_msg, err_msg_length);
+    case IMAGE_JPG:
+        return parse_jpeg_header(info, data, length, err_msg, err_msg_length);
+    case IMAGE_PPM:
+        return parse_ppm_header(info, data, length, err_msg, err_msg_length);
+
+    case IMAGE_UNKNOWN:
+    default:
+        snprintf(err_msg, err_msg_length, "Unknown file format");
+        return -EINVAL;
+    }
+}
+int parse_image_header_(struct img_info *info, const char *image_filename,
+                        char *err_msg, size_t err_msg_length)
+{
+    struct pdf_doc pdf;
+    size_t len;
+    uint8_t *data;
+
+    data = get_file(&pdf, image_filename, &len);
+    if (data == NULL) {
+        snprintf(err_msg, err_msg_length, pdf.errstr);
+        return pdf_get_errval(&pdf);
+    }
+    return parse_image_header(info, data, len, err_msg, err_msg_length);
+}
+
 int pdf_add_image_data(struct pdf_doc *pdf, struct pdf_object *page, float x,
                        float y, float display_width, float display_height,
                        const uint8_t *data, size_t len)
 {
-    // Try and determine which image format it is based on the content
-    switch (header_to_image(data, len)) {
+    struct img_info info = {
+        .width = 0,
+        .height = 0,
+        .image_format = IMAGE_UNKNOWN,
+    };
+    char err_msg[sizeof(pdf->errstr)];
+    memset(err_msg, '\0', sizeof(pdf->errstr));
+
+    // Parse the image data and determine which format it is
+    const int ret =
+        parse_image_header(&info, data, len, err_msg, sizeof(pdf->errstr));
+    if (ret) {
+        pdf_set_err(pdf, ret, err_msg);
+        return ret;
+    }
+
+    switch (info.image_format) {
     case IMAGE_PNG:
         return pdf_add_png_data(pdf, page, x, y, display_width,
-                                display_height, data, len);
+                                display_height, &info, data, len);
     case IMAGE_BMP:
         return pdf_add_bmp_data(pdf, page, x, y, display_width,
-                                display_height, data, len);
+                                display_height, &info, data, len);
     case IMAGE_JPG:
         return pdf_add_jpeg_data(pdf, page, x, y, display_width,
-                                 display_height, data, len);
+                                 display_height, &info, data, len);
     case IMAGE_PPM:
         return pdf_add_ppm_data(pdf, page, x, y, display_width,
-                                display_height, data, len);
+                                display_height, &info, data, len);
 
+    // This case should be caught in parse_image_header, but is checked
+    // here again for safety
     case IMAGE_UNKNOWN:
     default:
         return pdf_set_err(pdf, -EINVAL,
